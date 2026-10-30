@@ -136,6 +136,7 @@ sudo ip6tables -t nat -I PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-p
 | `-dnstt-compat`      | Use original dnstt wire format (8-byte ClientID, padding prefixes). Also sets `-idle-timeout` to 2m and `-keepalive` to 10s unless explicitly overridden. | `false`    |
 | `-clientid-size N`   | ClientID size in bytes (ignored when `-dnstt-compat` is set)       | `2`        |
 | `-record-type TYPE`  | DNS record type for downstream data: `txt`, `null`, `cname`, `a`, `aaaa`, `mx`, `ns`, `srv`, `caa`. Must match the client. Ignored (forced to `txt`) when `-dnstt-compat` is set. | `txt`      |
+| `-record-types LIST` | Comma-separated record types to serve simultaneously, each as an independent tunnel pipeline with its own effective MTU (e.g. `txt,cname,a`). Overrides `-record-type` when set. Each connecting client still picks one type via its own `-record-type`; different clients can use different types against the same server at once. Ignored (forced to `txt`) when `-dnstt-compat` is set. | (unset)    |
 | `-queue-size N`      | Packet queue size for transport and DNS layers                    | `512`      |
 | `-kcp-window-size N` | KCP send/receive window size in packets (0 = queue-size/2)        | `0`        |
 | `-queue-overflow MODE` | Queue overflow behavior: `drop` (silent discard) or `block` (backpressure) | `drop`     |

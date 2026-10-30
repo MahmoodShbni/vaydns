@@ -58,6 +58,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -116,9 +117,102 @@ var (
 	maxUDPPayload = 1280 - 40 - 8
 
 	// recordType is the DNS record type used for downstream data encoding.
-	// Set from the -record-type command-line flag.
+	// Set from the -record-type command-line flag. Retained for the
+	// single-type code paths and as the first entry of recordTypes.
 	recordType uint16 = dns.RRTypeTXT
+
+	// recordTypes is the ordered, de-duplicated set of DNS record types the
+	// server answers. Each type runs as an independent tunnel pipeline with
+	// its own effective MTU. Set from the -record-type / -record-types
+	// command-line flags. Always contains at least one entry.
+	recordTypes = []uint16{dns.RRTypeTXT}
 )
+
+// parseRecordTypes parses a comma-separated list of record type names into an
+// ordered, de-duplicated slice of RR type constants. It returns an error for
+// an empty list or any unknown type. Order is preserved; the first entry acts
+// as the default (e.g. for error responses).
+func parseRecordTypes(spec string) ([]uint16, error) {
+	seen := make(map[uint16]bool)
+	var types []uint16
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		rt, err := dns.ParseRecordType(part)
+		if err != nil {
+			return nil, err
+		}
+		if seen[rt] {
+			continue
+		}
+		seen[rt] = true
+		types = append(types, rt)
+	}
+	if len(types) == 0 {
+		return nil, fmt.Errorf("no record types specified")
+	}
+	return types, nil
+}
+
+// isServedRecordType reports whether the server answers queries of the given
+// record type (i.e. it has a configured pipeline for it).
+func isServedRecordType(rrType uint16) bool {
+	for _, t := range recordTypes {
+		if t == rrType {
+			return true
+		}
+	}
+	return false
+}
+
+// recordTypeName returns a short lowercase name for a record type, for logging.
+func recordTypeName(rrType uint16) string {
+	switch rrType {
+	case dns.RRTypeTXT:
+		return "txt"
+	case dns.RRTypeCNAME:
+		return "cname"
+	case dns.RRTypeNULL:
+		return "null"
+	case dns.RRTypeA:
+		return "a"
+	case dns.RRTypeAAAA:
+		return "aaaa"
+	case dns.RRTypeMX:
+		return "mx"
+	case dns.RRTypeNS:
+		return "ns"
+	case dns.RRTypeSRV:
+		return "srv"
+	case dns.RRTypeCAA:
+		return "caa"
+	default:
+		return fmt.Sprintf("type%d", rrType)
+	}
+}
+
+// effectiveMaxEncodedPayload returns the maximum amount of downstream payload
+// that fits in a single response for the given record type, keeping the UDP
+// response under maxUDPPayload in the worst case. This is the per-type basis
+// for the KCP MTU.
+func effectiveMaxEncodedPayload(rrType uint16, domain dns.Name) int {
+	switch rrType {
+	case dns.RRTypeCNAME, dns.RRTypeNS, dns.RRTypeMX, dns.RRTypeSRV:
+		return computeMaxEncodedPayloadNameBased(domain)
+	case dns.RRTypeA:
+		return computeMaxEncodedPayloadMultiRR(maxUDPPayload, 4)
+	case dns.RRTypeAAAA:
+		return computeMaxEncodedPayloadMultiRR(maxUDPPayload, 16)
+	case dns.RRTypeNULL:
+		return computeMaxEncodedPayload(maxUDPPayload, dns.EncodeRDataNULL)
+	case dns.RRTypeCAA:
+		return computeMaxEncodedPayload(maxUDPPayload, dns.EncodeRDataCAA)
+	default:
+		return computeMaxEncodedPayload(maxUDPPayload, dns.EncodeRDataTXT)
+	}
+}
 
 // base32Encoding is a base32 encoding without padding.
 var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -515,8 +609,8 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		return resp, nil
 	}
 
-	if question.Type != recordType {
-		// We only support the configured QTYPE.
+	if !isServedRecordType(question.Type) {
+		// We only support the configured QTYPEs.
 		resp.Flags |= dns.RcodeNameError
 		// No log message here; it's common for recursive resolvers to
 		// send NS or A queries when the client only asked for a TXT. I
@@ -693,7 +787,12 @@ func (m *FallbackManager) forwardReplies(proxyConn net.PacketConn, clientAddr ne
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch. Invalid DNS packets are passed to the FallbackManager.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager, stats *ServerStats, wireConfig turbotunnel.WireConfig) error {
+//
+// routeTo maps a query's QTYPE to the virtual PacketConn and record channel of
+// the pipeline that serves that record type. errorCh is a stable default
+// channel used to send error responses that belong to no pipeline (they carry
+// no tunnel data and do not depend on a pipeline's MTU).
+func recvLoop(domain dns.Name, dnsConn net.PacketConn, routeTo func(uint16) (*turbotunnel.QueuePacketConn, chan<- *record), errorCh chan<- *record, fallbackMgr *FallbackManager, stats *ServerStats, wireConfig turbotunnel.WireConfig) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -720,9 +819,23 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		}
 
 		resp, payload := responseFor(&query, domain)
+		// Determine which pipeline serves this query's record type. For a
+		// payload-bearing (NOERROR) response there is exactly one question,
+		// validated by responseFor; its type is guaranteed to be one we
+		// serve. For error responses the type may be unknown, in which case
+		// the query carries no tunnel data and is only answered.
+		var ttConn *turbotunnel.QueuePacketConn
+		var ch chan<- *record
+		if resp != nil && resp.Rcode() == dns.RcodeNoError && len(resp.Question) == 1 {
+			ttConn, ch = routeTo(resp.Question[0].Type)
+		}
+
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
-		if len(payload) < wireConfig.ClientIDSize {
+		if ttConn == nil {
+			// No pipeline for this query (error response or unserved
+			// type): nothing to feed into KCP.
+		} else if len(payload) < wireConfig.ClientIDSize {
 			// Payload is not long enough to contain a ClientID.
 			if resp != nil && resp.Rcode() == dns.RcodeNoError {
 				resp.Flags |= dns.RcodeNameError
@@ -748,14 +861,22 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				ttConn.QueueIncoming(p, clientID)
 			}
 		}
-		// If a response is called for, pass it to sendLoop via the channel.
+		// If a response is called for, pass it to the matching sendLoop via
+		// its channel. Error responses (no pipeline) are sent on a best-effort
+		// basis through any available pipeline's channel so the requester still
+		// gets an authoritative RCODE.
 		if resp != nil {
 			if resp.Rcode() == dns.RcodeNoError {
 				stats.incSuccess()
 			}
-			select {
-			case ch <- &record{resp, addr, clientID}:
-			default:
+			if ch == nil {
+				ch = errorCh
+			}
+			if ch != nil {
+				select {
+				case ch <- &record{resp, addr, clientID}:
+				default:
+				}
 			}
 		}
 	}
@@ -1130,54 +1251,69 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 
 	log.Infof("pubkey %x", noise.PubkeyFromPrivkey(privkey))
 
-	// We have a variable amount of room in which to encode downstream
-	// packets in each response, because each response must contain the
-	// query's Question section, which is of variable length. But we cannot
-	// give dynamic packet size limits to KCP; the best we can do is set a
-	// global maximum which no packet will exceed. We choose that maximum to
-	// keep the UDP payload size under maxUDPPayload, even in the worst case
-	// of a maximum-length name in the query's Question section.
-	var maxEncodedPayload int
-	switch recordType {
-	case dns.RRTypeCNAME, dns.RRTypeNS, dns.RRTypeMX, dns.RRTypeSRV:
-		maxEncodedPayload = computeMaxEncodedPayloadNameBased(domain)
-	case dns.RRTypeA:
-		maxEncodedPayload = computeMaxEncodedPayloadMultiRR(maxUDPPayload, 4)
-	case dns.RRTypeAAAA:
-		maxEncodedPayload = computeMaxEncodedPayloadMultiRR(maxUDPPayload, 16)
-	case dns.RRTypeNULL:
-		maxEncodedPayload = computeMaxEncodedPayload(maxUDPPayload, dns.EncodeRDataNULL)
-	case dns.RRTypeCAA:
-		maxEncodedPayload = computeMaxEncodedPayload(maxUDPPayload, dns.EncodeRDataCAA)
-	default:
-		maxEncodedPayload = computeMaxEncodedPayload(maxUDPPayload, dns.EncodeRDataTXT)
+	// Each record type runs as an independent tunnel pipeline: its own KCP
+	// listener (and therefore its own MTU), its own virtual PacketConn, and
+	// its own sendLoop. We cannot give dynamic packet-size limits to KCP, so
+	// each pipeline fixes a per-type maximum that keeps the UDP response
+	// under maxUDPPayload even in the worst case of a maximum-length name in
+	// the query's Question section. recvLoop reads the single UDP socket and
+	// routes each query to the pipeline matching its QTYPE.
+	//
+	// pipeline bundles the per-type machinery.
+	type pipeline struct {
+		ttConn            *turbotunnel.QueuePacketConn
+		ch                chan *record
+		maxEncodedPayload int
 	}
-	// 2 bytes accounts for a packet length prefix.
-	mtu := maxEncodedPayload - 2
-	if mtu < 80 {
-		if mtu < 0 {
-			mtu = 0
-		}
-		return fmt.Errorf("maximum UDP payload size of %d leaves only %d bytes for payload", maxUDPPayload, mtu)
-	}
-	log.Infof("effective MTU %d", mtu)
 
-	// Start up the virtual PacketConn for turbotunnel.
-	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2, queueSize, queueOverflowMode)
-	ln, err := kcp.ServeConn(nil, 0, 0, ttConn)
-	if err != nil {
-		return fmt.Errorf("opening KCP listener: %v", err)
-	}
-	defer ln.Close()
-	go func() {
-		err := acceptSessions(ln, privkey, mtu, upstream, idleTimeout, keepAlive, kcpWindowSize)
-		if err != nil {
-			log.Warnf("accept sessions: %v", err)
+	pipelines := make(map[uint16]*pipeline, len(recordTypes))
+	var lns []*kcp.Listener
+	defer func() {
+		for _, ln := range lns {
+			ln.Close()
 		}
 	}()
 
-	ch := make(chan *record, 100)
-	defer close(ch)
+	for _, rrType := range recordTypes {
+		maxEncodedPayload := effectiveMaxEncodedPayload(rrType, domain)
+		// 2 bytes accounts for a packet length prefix.
+		mtu := maxEncodedPayload - 2
+		if mtu < 80 {
+			if mtu < 0 {
+				mtu = 0
+			}
+			return fmt.Errorf("record type %s: maximum UDP payload size of %d leaves only %d bytes for payload",
+				recordTypeName(rrType), maxUDPPayload, mtu)
+		}
+		log.Infof("record type %s: effective MTU %d", recordTypeName(rrType), mtu)
+
+		// Start up the virtual PacketConn for turbotunnel.
+		ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2, queueSize, queueOverflowMode)
+		ln, err := kcp.ServeConn(nil, 0, 0, ttConn)
+		if err != nil {
+			return fmt.Errorf("record type %s: opening KCP listener: %v", recordTypeName(rrType), err)
+		}
+		lns = append(lns, ln)
+
+		go func(rrType uint16, ln *kcp.Listener) {
+			err := acceptSessions(ln, privkey, mtu, upstream, idleTimeout, keepAlive, kcpWindowSize)
+			if err != nil {
+				log.Warnf("record type %s: accept sessions: %v", recordTypeName(rrType), err)
+			}
+		}(rrType, ln)
+
+		ch := make(chan *record, 100)
+		defer close(ch)
+
+		go func(rrType uint16, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int) {
+			err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload, domain)
+			if err != nil {
+				log.Warnf("record type %s: sendLoop: %v", recordTypeName(rrType), err)
+			}
+		}(rrType, ttConn, ch, maxEncodedPayload)
+
+		pipelines[rrType] = &pipeline{ttConn: ttConn, ch: ch, maxEncodedPayload: maxEncodedPayload}
+	}
 
 	// Create a fallback manager if an address is specified.
 	var fallbackMgr *FallbackManager
@@ -1194,17 +1330,21 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		}
 	}()
 
-	// We could run multiple copies of sendLoop; that would allow more time
-	// for each response to collect downstream data before being evicted by
-	// another response that needs to be sent.
-	go func() {
-		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload, domain)
-		if err != nil {
-			log.Warnf("sendLoop: %v", err)
+	// routeTo returns the ttConn and record channel for a query's QTYPE, or
+	// nil if the type has no pipeline (should not happen: responseFor only
+	// returns a payload-bearing response for allowed types).
+	routeTo := func(rrType uint16) (*turbotunnel.QueuePacketConn, chan<- *record) {
+		if p := pipelines[rrType]; p != nil {
+			return p.ttConn, p.ch
 		}
-	}()
+		return nil, nil
+	}
 
-	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr, stats, wireConfig)
+	// Error responses carry no tunnel data; send them through the first
+	// configured pipeline's channel, which always exists.
+	errorCh := pipelines[recordTypes[0]].ch
+
+	return recvLoop(domain, dnsConn, routeTo, errorCh, fallbackMgr, stats, wireConfig)
 }
 
 var version = "dev"
@@ -1224,6 +1364,7 @@ func main() {
 	var compatDnstt bool
 	var clientIDSize int
 	var recordTypeStr string
+	var recordTypesStr string
 	var queueSize int
 	var kcpWindowSize int
 	var queueOverflowStr string
@@ -1260,6 +1401,7 @@ Example:
 	flag.BoolVar(&compatDnstt, "dnstt-compat", false, "use original dnstt wire format (8-byte ClientID, padding prefixes)")
 	flag.IntVar(&clientIDSize, "clientid-size", 2, "client ID size in bytes (ignored when -dnstt-compat is set)")
 	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS record type for downstream data (txt, null, cname, a, aaaa, mx, ns, srv, caa)")
+	flag.StringVar(&recordTypesStr, "record-types", "", "comma-separated DNS record types to serve simultaneously, each as an independent pipeline (e.g. txt,cname,a); overrides -record-type when set")
 	flag.IntVar(&queueSize, "queue-size", turbotunnel.QueueSize, "packet queue size for DNS tunnel transport")
 	flag.IntVar(&kcpWindowSize, "kcp-window-size", 0, "KCP send/receive window size in packets (0 = queue-size/2)")
 	flag.StringVar(&queueOverflowStr, "queue-overflow", string(turbotunnel.DefaultQueueOverflowMode), "queue overflow behavior: drop or block")
@@ -1282,12 +1424,19 @@ Example:
 	log.SetLevel(level)
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true, TimestampFormat: "2006-01-02 15:04:05"})
 
-	rt, err := dns.ParseRecordType(recordTypeStr)
+	// Determine the set of record types to serve. -record-types (plural),
+	// when set, takes precedence over -record-type (singular).
+	typesSpec := recordTypeStr
+	if recordTypesStr != "" {
+		typesSpec = recordTypesStr
+	}
+	types, err := parseRecordTypes(typesSpec)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
-	recordType = rt
+	recordTypes = types
+	recordType = types[0]
 
 	if genKey {
 		// -gen-key mode.
@@ -1444,8 +1593,9 @@ Example:
 
 		var wireConfig turbotunnel.WireConfig
 		if compatDnstt {
-			if recordType != dns.RRTypeTXT {
-				log.Warnf("-dnstt-compat forces record-type to txt; ignoring -record-type %s", recordTypeStr)
+			if len(recordTypes) != 1 || recordTypes[0] != dns.RRTypeTXT {
+				log.Warnf("-dnstt-compat forces record type to txt; ignoring %s", typesSpec)
+				recordTypes = []uint16{dns.RRTypeTXT}
 				recordType = dns.RRTypeTXT
 			}
 			wireConfig = turbotunnel.WireConfig{ClientIDSize: 8, Compat: true}
@@ -1475,14 +1625,16 @@ Example:
 		}
 		log.Infof("wire config: clientid-size=%d compat=%v", wireConfig.ClientIDSize, wireConfig.Compat)
 
-		switch recordType {
-		case dns.RRTypeCNAME, dns.RRTypeNS, dns.RRTypeMX, dns.RRTypeSRV:
-			explicitFlags := make(map[string]bool)
-			flag.Visit(func(f *flag.Flag) {
-				explicitFlags[f.Name] = true
-			})
-			if explicitFlags["mtu"] {
-				log.Warnf("-mtu has no effect with -record-type %s; capacity is bounded by the DNS name length limit (255 bytes)", recordTypeStr)
+		explicitFlags := make(map[string]bool)
+		flag.Visit(func(f *flag.Flag) {
+			explicitFlags[f.Name] = true
+		})
+		if explicitFlags["mtu"] {
+			for _, rt := range recordTypes {
+				switch rt {
+				case dns.RRTypeCNAME, dns.RRTypeNS, dns.RRTypeMX, dns.RRTypeSRV:
+					log.Warnf("-mtu has no effect for record type %s; its capacity is bounded by the DNS name length limit (255 bytes)", recordTypeName(rt))
+				}
 			}
 		}
 
