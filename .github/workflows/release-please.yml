@@ -1,61 +1,21 @@
-name: Release Please
+name: Build amd64
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
-    inputs:
-      force_release:
-        description: 'Force create a release PR even without conventional commits'
-        type: boolean
-        default: false
-      release_as:
-        description: 'Force release as specific version (e.g., 1.0.0). Leave empty for auto.'
-        type: string
-        default: ''
-
-permissions:
-  contents: write
-  pull-requests: write
-  packages: write
+  push:
+    branches: ['**']
 
 jobs:
-  release-please:
-    runs-on: ubuntu-latest
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-    steps:
-      - name: Release Please
-        id: release
-        uses: googleapis/release-please-action@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          release-as: ${{ inputs.release_as || '' }}
-
   build:
-    needs: release-please
-    if: ${{ needs.release-please.outputs.release_created }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
           - goos: linux
             goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: linux
-            goarch: arm
-            goarm: 7
-          - goos: linux
-            goarch: 386
           - goos: windows
             goarch: amd64
             suffix: .exe
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
 
     steps:
       - name: Checkout
@@ -71,86 +31,17 @@ jobs:
           CGO_ENABLED: '0'
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
         run: |
-          ARCH=${{ matrix.goarch }}
-          if [ "$ARCH" = "arm" ]; then
-            ARCH="armv7"
-          fi
           SUFFIX="${{ matrix.suffix }}"
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          VERSION="${TAG#v}"
-          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "vaydns-client-${{ matrix.goos }}-${ARCH}${SUFFIX}" ./vaydns-client
-          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "vaydns-server-${{ matrix.goos }}-${ARCH}${SUFFIX}" ./vaydns-server
-          chmod +x vaydns-client-* vaydns-server-*
+          VERSION="${GITHUB_SHA::7}"
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "vaydns-client-${{ matrix.goos }}-${{ matrix.goarch }}${SUFFIX}" ./vaydns-client
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "vaydns-server-${{ matrix.goos }}-${{ matrix.goarch }}${SUFFIX}" ./vaydns-server
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vaydns-${{ matrix.goos }}-${{ matrix.goarch == 'arm' && 'armv7' || matrix.goarch }}
+          name: vaydns-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
             vaydns-client-*
             vaydns-server-*
-
-  upload-assets:
-    needs: [release-please, build]
-    if: ${{ needs.release-please.outputs.release_created }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          pattern: vaydns-*
-
-      - name: Prepare release files
-        run: |
-          mkdir -p release
-          find artifacts -type f \( -name 'vaydns-client-*' -o -name 'vaydns-server-*' \) -exec cp {} release/ \;
-          cd release
-          for f in vaydns-*; do
-            sha256sum "$f" > "$f.sha256"
-          done
-
-      - name: Upload to Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload ${{ needs.release-please.outputs.tag_name }} release/* --repo ${{ github.repository }}
-
-  docker-release:
-    needs: release-please
-    if: ${{ needs.release-please.outputs.release_created }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract version
-        id: version
-        run: |
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          VERSION="${TAG#v}"
-          if [ -z "$VERSION" ]; then
-            echo "::error::tag_name is empty"
-            exit 1
-          fi
-          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          push: true
-          build-args: VERSION=${{ steps.version.outputs.VERSION }}
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}
-            ghcr.io/${{ github.repository }}:latest
+          retention-days: 90
