@@ -5,10 +5,9 @@ go 1.24.4
 require (
 	github.com/flynn/noise v1.1.0
 	github.com/jellydator/ttlcache/v3 v3.4.0
+	github.com/pierrec/lz4/v4 v4.1.22
 	github.com/refraction-networking/utls v1.8.2
 	github.com/sirupsen/logrus v1.9.4
-	github.com/xtaci/kcp-go/v5 v5.6.61
-	github.com/xtaci/smux v1.5.50
 	golang.org/x/crypto v0.47.0
 	golang.org/x/net v0.49.0
 )
@@ -26,4 +25,3 @@ require (
 	golang.org/x/time v0.14.0 // indirect
 )
 
-replace github.com/xtaci/kcp-go/v5 => github.com/net2share/kcp-go/v5 v5.0.0-20260325165956-416ba9d3856d

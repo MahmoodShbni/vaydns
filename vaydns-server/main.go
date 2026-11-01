@@ -67,11 +67,26 @@ import (
 
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/net2share/vaydns/dns"
+	"github.com/net2share/vaydns/internal/mdtransport"
 	"github.com/net2share/vaydns/noise"
 	"github.com/net2share/vaydns/turbotunnel"
-	"github.com/xtaci/kcp-go/v5"
-	"github.com/xtaci/smux"
 )
+
+// mdEncryptionMethod selects the mdtransport codec cipher (2 = ChaCha20).
+//
+// NOTE: the shared codec key is derived from the server's public key, which is
+// NOT secret, so this provides obfuscation-grade protection rather than Noise's
+// authenticated encryption. Supply a pre-shared key for real confidentiality.
+const mdEncryptionMethod = 2
+
+func mdSessionConfig(privkey []byte, mtu int) mdtransport.SessionConfig {
+	pub := noise.PubkeyFromPrivkey(privkey)
+	return mdtransport.SessionConfig{
+		EncryptionMethod: mdEncryptionMethod,
+		EncryptionKey:    fmt.Sprintf("%x", pub),
+		MTU:              mtu,
+	}
+}
 
 const (
 	defaultIdleTimeout = 10 * time.Second
@@ -320,7 +335,7 @@ func readKeyFromFile(filename string) ([]byte, error) {
 
 // handleStream bidirectionally connects a client stream with a TCP socket
 // addressed by upstream.
-func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
+func handleStream(stream *mdtransport.Stream, upstream string, conv uint32) error {
 	dialer := net.Dialer{
 		Timeout: upstreamDialTimeout,
 	}
@@ -363,95 +378,51 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 	return nil
 }
 
-// acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
-// then awaits smux streams. It passes each stream to handleStream.
-func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, idleTimeout time.Duration, keepAlive time.Duration) error {
-	// Put a Noise channel on top of the KCP conn.
-	rw, err := serverNoiseHandshake(conn, privkey, defaultHandshakeTimeout)
-	if err != nil {
-		return err
-	}
-
-	// Put an smux session on top of the encrypted Noise channel.
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = 2
-	smuxConfig.KeepAliveInterval = keepAlive
-	smuxConfig.KeepAliveTimeout = idleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
-	sess, err := smux.Server(rw, smuxConfig)
-	if err != nil {
-		return err
-	}
+// acceptStreams awaits mdtransport streams on an established session and passes
+// each to handleStream. Encryption and multiplexing are handled by the session.
+func acceptStreams(sess *mdtransport.Session, upstream string) error {
 	defer sess.Close()
-
+	conv := sess.Conv()
 	for {
 		stream, err := sess.AcceptStream()
 		if err != nil {
-			if err, ok := err.(net.Error); ok && err.Temporary() {
-				continue
-			}
 			return err
 		}
-		log.Infof("stream %08x:%d ready", conn.GetConv(), stream.ID())
+		log.Infof("stream %08x:%d ready", conv, stream.ID())
 		go func() {
 			defer func() {
-				log.Debugf("stream %08x:%d closed", conn.GetConv(), stream.ID())
+				log.Debugf("stream %08x:%d closed", conv, stream.ID())
 				stream.Close()
 			}()
-			err := handleStream(stream, upstream, conn.GetConv())
-			if err != nil {
-				log.Warnf("stream %08x:%d handleStream: %v", conn.GetConv(), stream.ID(), err)
+			if err := handleStream(stream, upstream, conv); err != nil {
+				log.Warnf("stream %08x:%d handleStream: %v", conv, stream.ID(), err)
 			}
 		}()
 	}
 }
 
-// serverNoiseHandshake performs the server-side Noise handshake with a deadline.
-// This prevents half-open KCP sessions from hanging forever before smux starts.
-func serverNoiseHandshake(conn *kcp.UDPSession, privkey []byte, timeout time.Duration) (io.ReadWriteCloser, error) {
-	conn.SetDeadline(time.Now().Add(timeout))
-	rw, err := noise.NewServer(conn, privkey)
-	conn.SetDeadline(time.Time{}) // clear deadline after the handshake
-	if err != nil {
-		return nil, fmt.Errorf("noise handshake: %v", err)
-	}
-	return rw, nil
-}
-
 // acceptSessions listens for incoming KCP connections and passes them to
 // acceptStreams.
-func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string, idleTimeout time.Duration, keepAlive time.Duration, kcpWindowSize int) error {
+func acceptSessions(pconn net.PacketConn, privkey []byte, mtu int, upstream string) error {
+	l, err := mdtransport.Listen(pconn, mdSessionConfig(privkey, mtu))
+	if err != nil {
+		return err
+	}
+	defer l.Close()
 	for {
-		conn, err := ln.AcceptKCP()
+		sess, err := l.Accept()
 		if err != nil {
-			if err, ok := err.(net.Error); ok && err.Temporary() {
-				continue
-			}
 			return err
 		}
-		log.Infof("session %08x ready", conn.GetConv())
-		// Permit coalescing the payloads of consecutive sends.
-		conn.SetStreamMode(true)
-		// Disable the dynamic congestion window (limit only by the
-		// maximum of local and remote static windows).
-		conn.SetNoDelay(
-			0, // default nodelay
-			0, // default interval
-			0, // default resend
-			1, // nc=1 => congestion window off
-		)
-		conn.SetWindowSize(kcpWindowSize, kcpWindowSize)
-		if rc := conn.SetMtu(mtu); !rc {
-			panic(rc)
-		}
+		log.Infof("session %08x ready", sess.Conv())
 		go func() {
+			conv := sess.Conv()
 			defer func() {
-				log.Debugf("session %08x closed", conn.GetConv())
-				conn.Close()
+				log.Debugf("session %08x closed", conv)
+				sess.Close()
 			}()
-			err := acceptStreams(conn, privkey, upstream, idleTimeout, keepAlive)
-			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-				log.Warnf("session %08x accept streams: %v", conn.GetConv(), err)
+			if err := acceptStreams(sess, upstream); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+				log.Warnf("session %08x accept streams: %v", conv, err)
 			}
 		}()
 	}
@@ -1251,13 +1222,14 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 
 	log.Infof("pubkey %x", noise.PubkeyFromPrivkey(privkey))
 
-	// Each record type runs as an independent tunnel pipeline: its own KCP
-	// listener (and therefore its own MTU), its own virtual PacketConn, and
-	// its own sendLoop. We cannot give dynamic packet-size limits to KCP, so
-	// each pipeline fixes a per-type maximum that keeps the UDP response
-	// under maxUDPPayload even in the worst case of a maximum-length name in
-	// the query's Question section. recvLoop reads the single UDP socket and
-	// routes each query to the pipeline matching its QTYPE.
+	// Each record type runs as an independent tunnel pipeline: its own
+	// mdtransport listener (and therefore its own MTU), its own virtual
+	// PacketConn, and its own sendLoop. We cannot give dynamic packet-size
+	// limits to the transport, so each pipeline fixes a per-type maximum that
+	// keeps the UDP response under maxUDPPayload even in the worst case of a
+	// maximum-length name in the query's Question section. recvLoop reads the
+	// single UDP socket and routes each query to the pipeline matching its
+	// QTYPE.
 	//
 	// pipeline bundles the per-type machinery.
 	type pipeline struct {
@@ -1267,12 +1239,6 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	}
 
 	pipelines := make(map[uint16]*pipeline, len(recordTypes))
-	var lns []*kcp.Listener
-	defer func() {
-		for _, ln := range lns {
-			ln.Close()
-		}
-	}()
 
 	for _, rrType := range recordTypes {
 		maxEncodedPayload := effectiveMaxEncodedPayload(rrType, domain)
@@ -1289,18 +1255,13 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 
 		// Start up the virtual PacketConn for turbotunnel.
 		ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2, queueSize, queueOverflowMode)
-		ln, err := kcp.ServeConn(nil, 0, 0, ttConn)
-		if err != nil {
-			return fmt.Errorf("record type %s: opening KCP listener: %v", recordTypeName(rrType), err)
-		}
-		lns = append(lns, ln)
 
-		go func(rrType uint16, ln *kcp.Listener) {
-			err := acceptSessions(ln, privkey, mtu, upstream, idleTimeout, keepAlive, kcpWindowSize)
+		go func(rrType uint16, ttConn *turbotunnel.QueuePacketConn, mtu int) {
+			err := acceptSessions(ttConn, privkey, mtu, upstream)
 			if err != nil {
 				log.Warnf("record type %s: accept sessions: %v", recordTypeName(rrType), err)
 			}
-		}(rrType, ln)
+		}(rrType, ttConn, mtu)
 
 		ch := make(chan *record, 100)
 		defer close(ch)

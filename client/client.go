@@ -21,6 +21,7 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -31,12 +32,11 @@ import (
 	"time"
 
 	"github.com/net2share/vaydns/dns"
+	"github.com/net2share/vaydns/internal/mdtransport"
 	"github.com/net2share/vaydns/noise"
 	"github.com/net2share/vaydns/turbotunnel"
 	utls "github.com/refraction-networking/utls"
 	log "github.com/sirupsen/logrus"
-	"github.com/xtaci/kcp-go/v5"
-	"github.com/xtaci/smux"
 )
 
 // Default timeouts for VayDNS mode.
@@ -211,10 +211,25 @@ type Tunnel struct {
 	forgedStats   *ForgedStats
 	resolverConn  net.PacketConn
 	dnsPacketConn *DNSPacketConn
-	kcpConn       *kcp.UDPSession
-	noiseChannel  io.ReadWriteCloser
-	smuxSession   *smux.Session
+	session       *mdtransport.Session
 	remoteAddr    net.Addr
+}
+
+// mdEncryptionMethod selects the mdtransport codec cipher (2 = ChaCha20).
+const mdEncryptionMethod = 2
+
+// mdSessionConfig derives the mdtransport SessionConfig for this tunnel.
+//
+// NOTE: the shared codec key is derived from the server's public key, which is
+// NOT secret. This replaces Noise's authenticated handshake with obfuscation-
+// grade protection only. For real confidentiality, supply a pre-shared key
+// (see the -psk follow-up noted in ATTRIBUTION/phase notes) instead.
+func (t *Tunnel) mdSessionConfig(mtu int) mdtransport.SessionConfig {
+	return mdtransport.SessionConfig{
+		EncryptionMethod: mdEncryptionMethod,
+		EncryptionKey:    hex.EncodeToString(t.TunnelServer.decodedNoisePubKey),
+		MTU:              mtu,
+	}
 }
 
 // NewTunnel creates a Tunnel with the given resolver and server configuration.
@@ -394,71 +409,32 @@ func (t *Tunnel) InitiateKCPConn(mtu int) error {
 	t.TunnelServer.MTU = mtu
 	log.Infof("effective MTU %d", mtu)
 
-	conn, err := kcp.NewConn2(t.remoteAddr, nil, 0, 0, t.dnsPacketConn)
-	if err != nil {
-		return fmt.Errorf("opening KCP conn: %v", err)
-	}
-	log.Infof("session %08x ready", conn.GetConv())
-	conn.SetStreamMode(true)
-	conn.SetNoDelay(0, 0, 0, 1)
-	conn.SetWindowSize(t.effectiveKCPWindowSize(), t.effectiveKCPWindowSize())
-	if rc := conn.SetMtu(mtu); !rc {
-		conn.Close()
-		return fmt.Errorf("failed to set KCP MTU to %d", mtu)
-	}
-
-	t.kcpConn = conn
-	return nil
-}
-
-// InitiateNoiseChannel performs the Noise protocol handshake with a timeout.
-// The timeout is controlled by HandshakeTimeout (default 30s).
-func (t *Tunnel) InitiateNoiseChannel() error {
 	t.applyDefaults()
-	rw, err := noiseHandshake(t.kcpConn, t.TunnelServer.decodedNoisePubKey, t.HandshakeTimeout)
+	sess, err := mdtransport.Dial(t.dnsPacketConn, t.remoteAddr, t.mdSessionConfig(mtu))
 	if err != nil {
-		return err
+		return fmt.Errorf("opening mdtransport session: %v", err)
 	}
-	t.noiseChannel = rw
+	log.Infof("session %08x ready", sess.Conv())
+	t.session = sess
 	return nil
 }
 
-// noiseHandshake performs the Noise handshake on conn with a deadline.
-// It sets a deadline before the handshake and clears it after, so the
-// deadline does not affect subsequent reads/writes on the connection.
-func noiseHandshake(conn *kcp.UDPSession, pubkey []byte, timeout time.Duration) (io.ReadWriteCloser, error) {
-	conn.SetDeadline(time.Now().Add(timeout))
-	rw, err := noise.NewClient(conn, pubkey)
-	conn.SetDeadline(time.Time{}) // clear deadline
-	if err != nil {
-		return nil, fmt.Errorf("noise handshake: %v", err)
-	}
-	return rw, nil
-}
+// InitiateNoiseChannel is retained for API compatibility. Encryption is now
+// handled inside the mdtransport session (see InitiateKCPConn), so this is a
+// no-op.
+func (t *Tunnel) InitiateNoiseChannel() error { return nil }
 
-// InitiateSmuxSession establishes a multiplexed session over the Noise channel.
-func (t *Tunnel) InitiateSmuxSession() error {
-	t.applyDefaults()
-
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = 2
-	smuxConfig.KeepAliveInterval = t.KeepAlive
-	smuxConfig.KeepAliveTimeout = t.IdleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024
-	sess, err := smux.Client(t.noiseChannel, smuxConfig)
-	if err != nil {
-		return fmt.Errorf("opening smux session: %v", err)
-	}
-	t.smuxSession = sess
-	return nil
-}
+// InitiateSmuxSession is retained for API compatibility. Stream multiplexing is
+// now part of the mdtransport session established in InitiateKCPConn, so this
+// is a no-op.
+func (t *Tunnel) InitiateSmuxSession() error { return nil }
 
 // openStreamWithTimeout opens an smux stream with a timeout. If the open
 // succeeds after the timeout, the late stream is closed to avoid leaking
 // capacity.
-func openStreamWithTimeout(conv uint32, timeout time.Duration, open func() (*smux.Stream, error)) (*smux.Stream, error) {
+func openStreamWithTimeout(conv uint32, timeout time.Duration, open func() (*mdtransport.Stream, error)) (*mdtransport.Stream, error) {
 	type result struct {
-		stream *smux.Stream
+		stream *mdtransport.Stream
 		err    error
 	}
 	ch := make(chan result, 1)
@@ -501,8 +477,8 @@ func shouldLogCopyError(err error) bool {
 
 // OpenStream opens a new multiplexed stream. Returns a net.Conn.
 func (t *Tunnel) OpenStream() (net.Conn, error) {
-	if t.smuxSession == nil {
-		return nil, fmt.Errorf("smux session is not initialized")
+	if t.session == nil {
+		return nil, fmt.Errorf("mdtransport session is not initialized")
 	}
 
 	timeout := t.OpenStreamTimeout
@@ -510,12 +486,9 @@ func (t *Tunnel) OpenStream() (net.Conn, error) {
 		timeout = DefaultOpenStreamTimeout
 	}
 
-	var conv uint32
-	if t.kcpConn != nil {
-		conv = t.kcpConn.GetConv()
-	}
+	conv := t.session.Conv()
 
-	stream, err := openStreamWithTimeout(conv, timeout, t.smuxSession.OpenStream)
+	stream, err := openStreamWithTimeout(conv, timeout, t.session.OpenStream)
 	if err != nil {
 		return nil, err
 	}
@@ -558,18 +531,10 @@ func (t *Tunnel) Handle(lconn *net.TCPConn) error {
 
 // Close tears down the tunnel and all its layers.
 func (t *Tunnel) Close() error {
-	if t.smuxSession != nil {
-		t.smuxSession.Close()
-		t.smuxSession = nil
-	}
-	if t.noiseChannel != nil {
-		t.noiseChannel.Close()
-		t.noiseChannel = nil
-	}
-	if t.kcpConn != nil {
-		log.Debugf("session %08x closed", t.kcpConn.GetConv())
-		t.kcpConn.Close()
-		t.kcpConn = nil
+	if t.session != nil {
+		log.Debugf("session %08x closed", t.session.Conv())
+		t.session.Close()
+		t.session = nil
 	}
 	t.closeTransportLayers()
 	return nil
@@ -653,11 +618,10 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 		}
 
 		// Create a new tunnel session with exponential backoff.
-		var conn *kcp.UDPSession
-		var sess *smux.Session
+		var sess *mdtransport.Session
 		delay = t.ReconnectMinDelay
 		for {
-			conn, sess, err = t.createSession(mtu)
+			sess, err = t.createSession(mtu)
 			if err == nil {
 				break
 			}
@@ -670,7 +634,7 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 		}
 
 		sessDone := sess.CloseChan()
-		conv := conn.GetConv()
+		conv := sess.Conv()
 
 		sessionAlive := true
 		for sessionAlive {
@@ -689,7 +653,6 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 					continue
 				}
 				sess.Close()
-				conn.Close()
 				t.closeTransportLayers()
 				return err
 			}
@@ -707,7 +670,7 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 			default:
 			}
 
-			go func(sess *smux.Session, conv uint32) {
+			go func(sess *mdtransport.Session, conv uint32) {
 				if sem != nil {
 					sem <- struct{}{}
 					defer func() { <-sem }()
@@ -722,48 +685,22 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 
 		log.Warnf("session %08x closed, reconnecting", conv)
 		sess.Close()
-		conn.Close()
 		t.closeTransportLayers()
 	}
 }
 
 // createSession creates a KCP+Noise+smux session (used by ListenAndServe).
-func (t *Tunnel) createSession(mtu int) (*kcp.UDPSession, *smux.Session, error) {
-	conn, err := kcp.NewConn2(t.remoteAddr, nil, 0, 0, t.dnsPacketConn)
+func (t *Tunnel) createSession(mtu int) (*mdtransport.Session, error) {
+	sess, err := mdtransport.Dial(t.dnsPacketConn, t.remoteAddr, t.mdSessionConfig(mtu))
 	if err != nil {
-		return nil, nil, fmt.Errorf("opening KCP conn: %v", err)
+		return nil, fmt.Errorf("opening mdtransport session: %v", err)
 	}
-	log.Infof("session %08x ready", conn.GetConv())
-	conn.SetStreamMode(true)
-	conn.SetNoDelay(0, 0, 0, 1)
-	conn.SetWindowSize(t.effectiveKCPWindowSize(), t.effectiveKCPWindowSize())
-	if rc := conn.SetMtu(mtu); !rc {
-		conn.Close()
-		return nil, nil, fmt.Errorf("failed to set KCP MTU to %d", mtu)
-	}
-
-	rw, err := noiseHandshake(conn, t.TunnelServer.decodedNoisePubKey, t.HandshakeTimeout)
-	if err != nil {
-		conn.Close()
-		return nil, nil, err
-	}
-
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = 2
-	smuxConfig.KeepAliveInterval = t.KeepAlive
-	smuxConfig.KeepAliveTimeout = t.IdleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024
-	sess, err := smux.Client(rw, smuxConfig)
-	if err != nil {
-		conn.Close()
-		return nil, nil, fmt.Errorf("opening smux session: %v", err)
-	}
-
-	return conn, sess, nil
+	log.Infof("session %08x ready", sess.Conv())
+	return sess, nil
 }
 
 // handleConn forwards a single TCP connection through the tunnel session.
-func (t *Tunnel) handleConn(local *net.TCPConn, sess *smux.Session, conv uint32) error {
+func (t *Tunnel) handleConn(local *net.TCPConn, sess *mdtransport.Session, conv uint32) error {
 	stream, err := openStreamWithTimeout(conv, t.OpenStreamTimeout, sess.OpenStream)
 	if err != nil {
 		return err
